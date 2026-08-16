@@ -39,6 +39,15 @@ typedef struct {
     int is_dir;
 } Entry;
 
+/* a single file recorded for the duplicate scan */
+typedef struct {
+    char *path;
+    char *name;      /* basename */
+    long long size;  /* apparent size (st_size), matching key */
+    long long bsize; /* allocated bytes (st_blocks*512), for reclaimable */
+    long long mtime; /* modification time, seconds */
+} DublFile;
+
 /* min-heap that keeps only the N largest entries (constant memory) */
 typedef struct {
     Entry *a;
@@ -48,10 +57,15 @@ typedef struct {
 static int g_color = 1;
 static int g_skip_sys = 0;
 static int g_top_n = 10;
+static int g_dubl_scan = 0;
 static const char *g_home = NULL;
 static long long g_nfiles = 0, g_ndirs = 0;
 
 static MinHeap g_dirs, g_files;
+
+/* duplicate scan list (all regular files under the scan root) */
+static DublFile *g_dubl = NULL;
+static long long g_dubl_n = 0, g_dubl_cap = 0;
 
 /* top-level (direct children of the scan root) list */
 static Entry *g_tl = NULL;
@@ -73,6 +87,23 @@ static void tl_add(const char *path, long long size, int is_dir) {
     g_tl[g_tln].size = size;
     g_tl[g_tln].is_dir = is_dir;
     g_tln++;
+}
+
+static void dubl_add(const char *path, const struct stat *st) {
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    if (g_dubl_n >= g_dubl_cap) {
+        g_dubl_cap = g_dubl_cap ? g_dubl_cap * 2 : 1024;
+        g_dubl = realloc(g_dubl, (size_t)g_dubl_cap * sizeof *g_dubl);
+        if (!g_dubl) die_oom();
+    }
+    g_dubl[g_dubl_n].path = strdup(path);
+    g_dubl[g_dubl_n].name = strdup(name);
+    if (!g_dubl[g_dubl_n].path || !g_dubl[g_dubl_n].name) die_oom();
+    g_dubl[g_dubl_n].size = st->st_size;
+    g_dubl[g_dubl_n].bsize = st->st_blocks > 0 ? (long long)st->st_blocks * 512 : 0;
+    g_dubl[g_dubl_n].mtime = (long long)st->st_mtime;
+    g_dubl_n++;
 }
 
 /* ---------------- min-heap of largest N ---------------- */
@@ -173,15 +204,21 @@ static long long walk(const char *path, int depth) {
             long long subsz = 0;
             if (depth < MAX_DEPTH) subsz = walk(full, depth + 1);
             sum += subsz;
-            if (depth == 0) tl_add(full, subsz, 1);
-            heap_push(&g_dirs, full, subsz, 1);
+            if (!g_dubl_scan) {
+                if (depth == 0) tl_add(full, subsz, 1);
+                heap_push(&g_dirs, full, subsz, 1);
+            }
         } else {
             /* use allocated blocks, not apparent size, to show real disk usage */
             long long sz = st.st_blocks > 0 ? (long long)st.st_blocks * 512 : 0;
             sum += sz;
             g_nfiles++;
-            if (depth == 0) tl_add(full, sz, 0);
-            heap_push(&g_files, full, sz, 0);
+            if (g_dubl_scan) {
+                if (S_ISREG(st.st_mode)) dubl_add(full, &st);
+            } else {
+                if (depth == 0) tl_add(full, sz, 0);
+                heap_push(&g_files, full, sz, 0);
+            }
         }
     }
     closedir(d);
@@ -310,21 +347,96 @@ static void print_header(const char *root, long long total) {
            CE(ANSI_BOLD), CE(ANSI_RESET), CE(ANSI_YELLOW), ts, CE(ANSI_RESET));
     printf("%sFiles%s         : %s\n", CE(ANSI_BOLD), CE(ANSI_RESET), fs);
     printf("%sDirectories%s   : %s\n", CE(ANSI_BOLD), CE(ANSI_RESET), ds);
-    printf("%sTop N%s         : %d\n", CE(ANSI_BOLD), CE(ANSI_RESET), g_top_n);
+    if (g_dubl_scan)
+        printf("%sDup scan%s      : by name + size + mtime\n",
+               CE(ANSI_BOLD), CE(ANSI_RESET));
+    else
+        printf("%sTop N%s         : %d\n", CE(ANSI_BOLD), CE(ANSI_RESET), g_top_n);
 
     if (strcmp(root, "/") == 0 && geteuid() != 0)
         printf("%sNote%s: running as non-root, some directories may be unreadable.\n",
                CE(ANSI_BOLD), CE(ANSI_RESET));
 }
 
+/* ---------------- duplicate scan ---------------- */
+
+static int dubl_cmp(const void *x, const void *y) {
+    const DublFile *a = x, *b = y;
+    int c = strcmp(a->name, b->name);
+    if (c) return c;
+    if (a->size != b->size) return a->size < b->size ? -1 : 1;
+    if (a->mtime != b->mtime) return a->mtime < b->mtime ? -1 : 1;
+    return strcmp(a->path, b->path);
+}
+
+static int dubl_same(const DublFile *a, const DublFile *b) {
+    return a->size == b->size && a->mtime == b->mtime &&
+           strcmp(a->name, b->name) == 0;
+}
+
+static void print_dubl(void) {
+    qsort(g_dubl, (size_t)g_dubl_n, sizeof *g_dubl, dubl_cmp);
+
+    /* count groups of size >= 2 */
+    long long groups = 0, dup_copies = 0, wasted = 0, i = 0;
+    while (i < g_dubl_n) {
+        long long j = i + 1;
+        while (j < g_dubl_n && dubl_same(&g_dubl[i], &g_dubl[j])) j++;
+        if (j - i > 1) {
+            groups++;
+            dup_copies += j - i;
+            wasted += (j - i - 1) * g_dubl[i].bsize;
+        }
+        i = j;
+    }
+
+    section("DUPLICATE FILES (same name + size + mtime)");
+    if (groups == 0) {
+        printf("  %s(no duplicates found)%s\n", CE(ANSI_DIM), CE(ANSI_RESET));
+        return;
+    }
+
+    char ws[32];
+    fmt_size(ws, sizeof ws, wasted);
+    printf("  %s%lld%s group%s of duplicates, %s%lld%s duplicate files, "
+           "%s%s%s reclaimable %s%s%s\n",
+           CE(ANSI_BOLD), groups, CE(ANSI_RESET), groups == 1 ? "" : "s",
+           CE(ANSI_BOLD), dup_copies, CE(ANSI_RESET),
+           CE(ANSI_YELLOW), ws, CE(ANSI_RESET),
+           CE(ANSI_DIM), "(keep one copy per group)", CE(ANSI_RESET));
+
+    int idx = 0;
+    i = 0;
+    while (i < g_dubl_n) {
+        long long j = i + 1;
+        while (j < g_dubl_n && dubl_same(&g_dubl[i], &g_dubl[j])) j++;
+        if (j - i > 1) {
+            idx++;
+            char sz[32];
+            fmt_size(sz, sizeof sz, g_dubl[i].size);
+            printf("\n  %s#%d%s  \"%s%s%s\"  %s%lld copies%s %s(%s each)%s\n",
+                   CE(ANSI_DIM), idx, CE(ANSI_RESET),
+                   CE(ANSI_BOLD), g_dubl[i].name, CE(ANSI_RESET),
+                   CE(ANSI_BOLD), j - i, CE(ANSI_RESET),
+                   CE(ANSI_DIM), sz, CE(ANSI_RESET));
+            for (long long k = i; k < j; k++)
+                printf("      %s%s%s\n", CE(ANSI_CYAN), disp(g_dubl[k].path),
+                       CE(ANSI_RESET));
+        }
+        i = j;
+    }
+}
+
 static void usage(FILE *out) {
     fprintf(out,
         "Usage: %s [OPTIONS] [PATH]\n\n"
         "A lightweight disk usage analyzer. Shows which directories and files\n"
-        "consume the most space, including all nested content.\n\n"
+        "consume the most space, including all nested content. Can also find\n"
+        "duplicate files (same name and metadata).\n\n"
         "Modes:\n"
         "  --allsys          Analyze the whole filesystem (from /)\n"
-        "  --usr             Analyze the current user's home directory (from ~)\n\n"
+        "  --usr             Analyze the current user's home directory (from ~)\n"
+        "  --dubl-scan       Find duplicate files by name + size + mtime\n\n"
         "Options:\n"
         "  --top <N>         Show top N results (default: 10)\n"
         "  --no-color        Disable colored output\n"
@@ -350,6 +462,8 @@ int main(int argc, char **argv) {
                 return 1;
             }
             root = h;
+        } else if (strcmp(argv[i], "--dubl-scan") == 0) {
+            g_dubl_scan = 1;
         } else if (strcmp(argv[i], "--top") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "%s: --top requires a number\n", PROG);
@@ -385,8 +499,10 @@ int main(int argc, char **argv) {
     g_skip_sys = skip_sys;
     g_home = strcmp(root, "/") == 0 ? NULL : getenv("HOME");
 
-    heap_init(&g_dirs, g_top_n);
-    heap_init(&g_files, g_top_n);
+    if (!g_dubl_scan) {
+        heap_init(&g_dirs, g_top_n);
+        heap_init(&g_files, g_top_n);
+    }
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -394,42 +510,54 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double sec = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 
-    qsort(g_tl, (size_t)g_tln, sizeof *g_tl, cmp_desc);
-    qsort(g_dirs.a, (size_t)g_dirs.n, sizeof *g_dirs.a, cmp_desc);
-    qsort(g_files.a, (size_t)g_files.n, sizeof *g_files.a, cmp_desc);
-
     print_header(root, total);
 
-    section("TOP-LEVEL ENTRIES (direct children, largest first)");
-    int shown = g_tln < g_top_n ? g_tln : g_top_n;
-    if (shown == 0) {
-        printf("  (none)\n");
+    if (g_dubl_scan) {
+        print_dubl();
     } else {
-        for (int i = 0; i < shown; i++)
-            print_row(i + 1, &g_tl[i], total, g_tl[0].size);
-    }
+        qsort(g_tl, (size_t)g_tln, sizeof *g_tl, cmp_desc);
+        qsort(g_dirs.a, (size_t)g_dirs.n, sizeof *g_dirs.a, cmp_desc);
+        qsort(g_files.a, (size_t)g_files.n, sizeof *g_files.a, cmp_desc);
 
-    section("LARGEST DIRECTORIES (all levels)");
-    if (g_dirs.n == 0) {
-        printf("  (none)\n");
-    } else {
-        for (int i = 0; i < g_dirs.n; i++)
-            print_row(i + 1, &g_dirs.a[i], total, g_dirs.a[0].size);
-    }
+        section("TOP-LEVEL ENTRIES (direct children, largest first)");
+        int shown = g_tln < g_top_n ? g_tln : g_top_n;
+        if (shown == 0) {
+            printf("  (none)\n");
+        } else {
+            for (int i = 0; i < shown; i++)
+                print_row(i + 1, &g_tl[i], total, g_tl[0].size);
+        }
 
-    section("LARGEST FILES");
-    if (g_files.n == 0) {
-        printf("  (none)\n");
-    } else {
-        for (int i = 0; i < g_files.n; i++)
-            print_row(i + 1, &g_files.a[i], total, g_files.a[0].size);
+        section("LARGEST DIRECTORIES (all levels)");
+        if (g_dirs.n == 0) {
+            printf("  (none)\n");
+        } else {
+            for (int i = 0; i < g_dirs.n; i++)
+                print_row(i + 1, &g_dirs.a[i], total, g_dirs.a[0].size);
+        }
+
+        section("LARGEST FILES");
+        if (g_files.n == 0) {
+            printf("  (none)\n");
+        } else {
+            for (int i = 0; i < g_files.n; i++)
+                print_row(i + 1, &g_files.a[i], total, g_files.a[0].size);
+        }
     }
 
     printf("\n%sDone in %.2f s.%s\n", CE(ANSI_DIM), sec, CE(ANSI_RESET));
 
-    heap_free(&g_dirs);
-    heap_free(&g_files);
-    for (int i = 0; i < g_tln; i++) free(g_tl[i].path);
-    free(g_tl);
+    if (g_dubl_scan) {
+        for (long long i = 0; i < g_dubl_n; i++) {
+            free(g_dubl[i].path);
+            free(g_dubl[i].name);
+        }
+        free(g_dubl);
+    } else {
+        heap_free(&g_dirs);
+        heap_free(&g_files);
+        for (int i = 0; i < g_tln; i++) free(g_tl[i].path);
+        free(g_tl);
+    }
     return 0;
 }

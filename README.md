@@ -33,13 +33,16 @@ LARGEST DIRECTORIES (all levels)
 
 ## Features
 
-- **Two scan modes**: `--allsys` (whole filesystem from `/`) and `--usr` (your `~`).
+- **Three scan modes**: `--allsys` (whole filesystem from `/`), `--usr`
+  (your `~`) and `--dubl-scan` (duplicate-file detection).
 - **Top-level breakdown** plus an **all-levels ranking** of the biggest
   directories and files.
+- **Duplicate scan**: finds groups of files that share the same name, size and
+  modification time (`--dubl-scan`).
 - Sizes are based on **allocated blocks** (`st_blocks`), so it reports real disk
   usage, not apparent file size.
 - **Constant memory**: only the top N entries are kept, so it stays lightweight
-  even on very large filesystems.
+  even on very large filesystems (regular scans).
 - Colored, human-readable output with percentage bars (auto-disabled when piped).
 - No dependencies beyond the standard C library. No libraries, no config, no bloat.
 
@@ -78,6 +81,7 @@ du-rank [OPTIONS] [PATH]
 | ---- | ----------- |
 | `--allsys` | Analyze the whole filesystem, starting at `/` |
 | `--usr`    | Analyze the current user's home directory (`~`) |
+| `--dubl-scan` | Find duplicate files by name + size + mtime |
 
 | Option        | Description |
 | ------------- | ----------- |
@@ -99,6 +103,9 @@ du-rank --usr
 
 # Top 5 biggest files in /var only
 du-rank --top 5 /var
+
+# Find duplicate files (same name + size + mtime) in your home directory
+du-rank --dubl-scan --usr
 ```
 
 ## How it works
@@ -106,6 +113,14 @@ du-rank --top 5 /var
 The program walks the directory tree depth-first without following symlinks
 (so it cannot loop). For every directory it sums the size of everything beneath
 it and keeps the top N results in a small min-heap — no big in-memory lists.
+
+With `--dubl-scan` the same walk records every regular file (its path, name,
+apparent size and modification time), sorts the list by name, then size, then
+mtime, and reports any run of ≥2 files that match on all three fields. A group
+means the files share a name, a size and a modification time — they are very
+likely identical copies. No file contents are compared, and the "reclaimable"
+figure shows how much allocated disk space you would free by keeping one copy
+per group (note that hard links point to the same data on disk).
 
 Notes:
 
@@ -115,6 +130,9 @@ Notes:
   complete scan of `/`, run as root (`sudo`).
 - Disk usage is measured in 512-byte blocks (`st_blocks`), matching tools like
   `du`.
+- Regular scans keep only the top N entries in memory. `--dubl-scan` keeps one
+  small record per file, so memory use grows with the number of files — use it
+  on a specific directory for large filesystems.
 
 ## License
 
