@@ -20,7 +20,7 @@
 #include <time.h>
 
 #define PROG      "du-rank"
-#define VERSION   "1.0.0"
+#define VERSION   "1.1.0"
 #define MAX_DEPTH 512
 #define BAR_WIDTH 16
 

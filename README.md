@@ -7,7 +7,7 @@ nested folders and files — with pretty colored output.
 ```console
 $ du-rank --allsys --top 8
 
-du-rank v1.0.0
+du-rank v1.1.0
 ============================
 Scan path     : /
 Total size    : 249.7 GiB
