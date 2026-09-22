@@ -7,7 +7,7 @@ nested folders and files — with pretty colored output.
 ```console
 $ du-rank --allsys --top 8
 
-du-rank v1.1.0
+du-rank v1.2.0
 ============================
 Scan path     : /
 Total size    : 249.7 GiB
@@ -33,14 +33,20 @@ LARGEST DIRECTORIES (all levels)
 
 ## Features
 
-- **Three scan modes**: `--allsys` (whole filesystem from `/`), `--usr`
-  (your `~`) and `--dubl-scan` (duplicate-file detection).
+- **Four scan modes**: `--allsys` (whole filesystem from `/`), `--usr`
+  (your `~`), `--drive <NAME>` (one mounted drive by its `/dev` name) and
+  `--dubl-scan` (duplicate-file detection).
 - **Top-level breakdown** plus an **all-levels ranking** of the biggest
   directories and files.
 - **Duplicate scan**: finds groups of files that share the same name, size and
   modification time (`--dubl-scan`).
 - Sizes are based on **allocated blocks** (`st_blocks`), so it reports real disk
   usage, not apparent file size.
+- **One filesystem per scan**: anything mounted from another device is skipped
+  at any depth — `/tmp` on tmpfs, `/dev`, `/proc`, `/sys`, Docker overlay/shm
+  mounts under `/var/lib/docker`, other disks under `/mnt` or `/media`, etc.
+- **Hard links are counted once**, just like symlinks are never followed (only
+  inodes with `nlink > 1` are tracked, in a small lazily-allocated hash set).
 - **Constant memory**: only the top N entries are kept, so it stays lightweight
   even on very large filesystems (regular scans).
 - Colored, human-readable output with percentage bars (auto-disabled when piped).
@@ -81,6 +87,7 @@ du-rank [OPTIONS] [PATH]
 | ---- | ----------- |
 | `--allsys` | Analyze the whole filesystem, starting at `/` |
 | `--usr`    | Analyze the current user's home directory (`~`) |
+| `--drive <NAME>` | Analyze one mounted drive by its `/dev` name (e.g. `sdb1`) |
 | `--dubl-scan` | Find duplicate files by name + size + mtime |
 
 | Option        | Description |
@@ -104,6 +111,9 @@ du-rank --usr
 # Top 5 biggest files in /var only
 du-rank --top 5 /var
 
+# What eats space on the sdb1 drive? (resolved via /proc/self/mounts)
+du-rank --drive sdb1
+
 # Find duplicate files (same name + size + mtime) in your home directory
 du-rank --dubl-scan --usr
 ```
@@ -120,12 +130,19 @@ mtime, and reports any run of ≥2 files that match on all three fields. A group
 means the files share a name, a size and a modification time — they are very
 likely identical copies. No file contents are compared, and the "reclaimable"
 figure shows how much allocated disk space you would free by keeping one copy
-per group (note that hard links point to the same data on disk).
+per group (hard links are counted once, so they never form a group).
 
 Notes:
 
+- Every scan stays on the scan root's filesystem (like `du -x`): directories
+  and files from other devices are skipped wherever they are mounted. That is
+  why `--allsys` ignores `/tmp` when it is a tmpfs, Docker's virtual mounts
+  deep inside `/var/lib/docker`, and any separately mounted disks. To analyze
+  such a disk, point at it directly: `du-rank --drive sdb1` (the name is looked
+  up in `/proc/self/mounts`, `/dev/` is prepended when missing) or pass its
+  mountpoint as `PATH`.
 - When scanning `/`, the virtual/pseudo filesystems `/dev`, `/proc`, `/run` and
-  `/sys` are skipped — they hold no real user data.
+  `/sys` are skipped by name as well — they hold no real user data.
 - Directories you cannot read (permission denied) are skipped silently. For a
   complete scan of `/`, run as root (`sudo`).
 - Disk usage is measured in 512-byte blocks (`st_blocks`), matching tools like

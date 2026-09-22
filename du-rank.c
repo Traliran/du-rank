@@ -20,7 +20,7 @@
 #include <time.h>
 
 #define PROG      "du-rank"
-#define VERSION   "1.1.0"
+#define VERSION   "1.2.0"
 #define MAX_DEPTH 512
 #define BAR_WIDTH 16
 
@@ -60,6 +60,15 @@ static int g_top_n = 10;
 static int g_dubl_scan = 0;
 static const char *g_home = NULL;
 static long long g_nfiles = 0, g_ndirs = 0;
+
+/* stay on the scan root's filesystem, skip mounts at any depth */
+static dev_t g_root_dev;
+static int g_one_fs = 0;
+
+/* inodes of hardlinked files already counted (only filled when nlink > 1) */
+typedef struct { dev_t dev; ino_t ino; char used; } SeenEnt;
+static SeenEnt *g_seen;
+static size_t g_seen_cap, g_seen_n;
 
 static MinHeap g_dirs, g_files;
 
@@ -165,6 +174,90 @@ static void heap_push(MinHeap *h, const char *path, long long size, int is_dir) 
     }
 }
 
+/* ---------------- hardlink dedup (lazy hash set of inodes) ---------------- */
+
+/* allocated on first hardlinked file only, so no cost when there are none */
+static unsigned long long ino_hash(dev_t dev, ino_t ino) {
+    unsigned long long h = (unsigned long long)ino * 11400714819323198485llu;
+    h ^= (unsigned long long)dev + 0x9e3779b97f4a7c15llu + (h << 6) + (h >> 2);
+    return h;
+}
+
+static void seen_grow(void) {
+    size_t ncap = g_seen_cap ? g_seen_cap * 2 : 512;
+    SeenEnt *n = calloc(ncap, sizeof *n);
+    if (!n) die_oom();
+    size_t mask = ncap - 1;
+    for (size_t i = 0; i < g_seen_cap; i++) {
+        if (!g_seen[i].used) continue;
+        size_t j = (size_t)ino_hash(g_seen[i].dev, g_seen[i].ino) & mask;
+        while (n[j].used) j = (j + 1) & mask;
+        n[j] = g_seen[i];
+    }
+    free(g_seen);
+    g_seen = n;
+    g_seen_cap = ncap;
+}
+
+/* 1 if this inode was already counted, else remember it and return 0 */
+static int seen_before(dev_t dev, ino_t ino) {
+    if (g_seen_n * 2 >= g_seen_cap) seen_grow();
+    size_t mask = g_seen_cap - 1;
+    size_t i = (size_t)ino_hash(dev, ino) & mask;
+    for (;;) {
+        if (!g_seen[i].used) {
+            g_seen[i].dev = dev;
+            g_seen[i].ino = ino;
+            g_seen[i].used = 1;
+            g_seen_n++;
+            return 0;
+        }
+        if (g_seen[i].dev == dev && g_seen[i].ino == ino) return 1;
+        i = (i + 1) & mask;
+    }
+}
+
+/* ---------------- drive lookup ---------------- */
+
+/* map a /dev name (e.g. "sdb1" or "/dev/sdb1") to its mountpoint via /proc/self/mounts */
+static char *drive_mountpoint(const char *drive) {
+    char want[PATH_MAX];
+    if (drive[0] == '/')
+        snprintf(want, sizeof want, "%s", drive);
+    else
+        snprintf(want, sizeof want, "/dev/%s", drive);
+    FILE *f = fopen("/proc/self/mounts", "r");
+    if (!f) return NULL;
+    char line[PATH_MAX * 2 + 256];
+    char *found = NULL;
+    while (fgets(line, sizeof line, f)) {
+        char mdev[PATH_MAX], mnt[PATH_MAX];
+        if (sscanf(line, "%4095s %4095s", mdev, mnt) != 2) continue;
+        if (strcmp(mdev, want) != 0) continue;
+        /* unescape octal codes (space is \040, newline is \012) */
+        char ub[PATH_MAX];
+        size_t o = 0;
+        for (size_t i = 0; mnt[i] && o + 1 < sizeof ub; i++) {
+            if (mnt[i] == '\\' && mnt[i + 1] >= '0' && mnt[i + 1] <= '7') {
+                int v = 0, k = 0;
+                while (k < 3 && mnt[i + 1 + k] >= '0' && mnt[i + 1 + k] <= '7') {
+                    v = v * 8 + (mnt[i + 1 + k] - '0');
+                    k++;
+                }
+                ub[o++] = (char)v;
+                i += (size_t)k;
+            } else {
+                ub[o++] = mnt[i];
+            }
+        }
+        ub[o] = '\0';
+        found = strdup(ub);
+        break;
+    }
+    fclose(f);
+    return found;
+}
+
 /* ---------------- filesystem walk ---------------- */
 
 /* virtual / pseudo filesystems that make no sense to scan */
@@ -198,6 +291,9 @@ static long long walk(const char *path, int depth) {
         struct stat st;
         if (lstat(full, &st) != 0) continue;
 
+        /* skip anything mounted from another device, at any depth */
+        if (g_one_fs && st.st_dev != g_root_dev) continue;
+
         if (S_ISDIR(st.st_mode)) {
             if (depth == 0 && g_skip_sys && is_skipped_sys(name)) continue;
             g_ndirs++;
@@ -209,6 +305,9 @@ static long long walk(const char *path, int depth) {
                 heap_push(&g_dirs, full, subsz, 1);
             }
         } else {
+            /* count each hardlinked inode once, like symlinks are skipped once */
+            if (S_ISREG(st.st_mode) && st.st_nlink > 1 &&
+                seen_before(st.st_dev, st.st_ino)) continue;
             /* use allocated blocks, not apparent size, to show real disk usage */
             long long sz = st.st_blocks > 0 ? (long long)st.st_blocks * 512 : 0;
             sum += sz;
@@ -436,6 +535,7 @@ static void usage(FILE *out) {
         "Modes:\n"
         "  --allsys          Analyze the whole filesystem (from /)\n"
         "  --usr             Analyze the current user's home directory (from ~)\n"
+        "  --drive <NAME>    Analyze one mounted drive by its /dev name (e.g. sdb1)\n"
         "  --dubl-scan       Find duplicate files by name + size + mtime\n\n"
         "Options:\n"
         "  --top <N>         Show top N results (default: 10)\n"
@@ -449,6 +549,8 @@ static void usage(FILE *out) {
 
 int main(int argc, char **argv) {
     const char *root = NULL;
+    const char *drive = NULL;
+    int have_path = 0;
     int skip_sys = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -464,6 +566,12 @@ int main(int argc, char **argv) {
             root = h;
         } else if (strcmp(argv[i], "--dubl-scan") == 0) {
             g_dubl_scan = 1;
+        } else if (strcmp(argv[i], "--drive") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: --drive requires a device name (e.g. sdb1)\n", PROG);
+                return 2;
+            }
+            drive = argv[++i];
         } else if (strcmp(argv[i], "--top") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "%s: --top requires a number\n", PROG);
@@ -482,7 +590,19 @@ int main(int argc, char **argv) {
             return 2;
         } else {
             root = argv[i]; /* positional path overrides the mode */
+            have_path = 1;
         }
+    }
+
+    char *drive_root = NULL;
+    if (drive && !have_path) {
+        drive_root = drive_mountpoint(drive);
+        if (!drive_root) {
+            fprintf(stderr, "%s: drive '%s' not found (is it mounted? see /proc/self/mounts)\n",
+                    PROG, drive);
+            return 1;
+        }
+        root = drive_root;
     }
 
     if (!root) {
@@ -498,6 +618,13 @@ int main(int argc, char **argv) {
 
     g_skip_sys = skip_sys;
     g_home = strcmp(root, "/") == 0 ? NULL : getenv("HOME");
+
+    /* pin the scan to the root's filesystem; mounts are skipped at any depth */
+    struct stat rst;
+    if (stat(root, &rst) == 0) {
+        g_root_dev = rst.st_dev;
+        g_one_fs = 1;
+    }
 
     if (!g_dubl_scan) {
         heap_init(&g_dirs, g_top_n);
@@ -559,5 +686,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < g_tln; i++) free(g_tl[i].path);
         free(g_tl);
     }
+    free(g_seen);
+    free(drive_root);
     return 0;
 }
