@@ -151,6 +151,22 @@ Notes:
   small record per file, so memory use grows with the number of files — use it
   on a specific directory for large filesystems.
 
+## Contributing
+
+Contributions are welcome. This repository does not include harness-specific folders.
+
+### AI-Assisted Contributions
+
+AI assistance is accepted only when you use the `TSkRun` skill from [https://github.com/Traliran/tskrun](https://github.com/Traliran/tskrun). Changes made with AI without following `TSkRun` will not be accepted.
+
+In the pull request description, the **very first line** (right after the title/heading) must state that the patch was made with AI, followed by the `TSkRun` task report(s) (each strictly under 1000 tokens). If there were multiple AI tasks or runs, include **all** of them.
+
+### Human Contributions
+
+If a human wrote the patch, state that on the **first line after the heading** in the pull request description, followed by a description from the human author. There are no strict formatting rules for human descriptions beyond that first line.
+
+---
+
 ## License
 
 GNU GPL
